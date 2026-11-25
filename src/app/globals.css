@@ -1,0 +1,9 @@
+@import "tailwindcss";
+
+.wrapper p:not(.eyebrow):not(.site):not(.greeting):not(.sig),
+.wrapper .summary-strip,
+.wrapper .insight,
+.wrapper ul.goals li,
+.wrapper table.material td {
+  text-align: justify;
+}
