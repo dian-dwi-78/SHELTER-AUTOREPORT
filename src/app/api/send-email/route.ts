@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import MailComposer from 'nodemailer/lib/mail-composer';
 import { auth } from '@/auth';
+import { prisma } from '@/lib/prisma';
 import type { SendEmailPayload } from '@/types/report';
 
 function normalizeEmails(raw?: string): string {
@@ -13,6 +14,15 @@ function normalizeEmails(raw?: string): string {
 }
 
 export async function POST(req: NextRequest) {
+  let senderEmail = '';
+  let toList = '';
+  let ccList = '';
+  let subjectStr = '(Tanpa Subjek)';
+  let htmlForPreview = '';
+  let trainingName: string | null = null;
+  let siteName: string | null = null;
+  const attachmentNames: string[] = [];
+
   try {
     const session = (await auth()) as {
       user?: { email?: string | null; name?: string | null };
@@ -26,16 +36,25 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const payload: SendEmailPayload = await req.json();
+    senderEmail = session.user.email;
 
-    const toList = normalizeEmails(payload.to);
-    const ccList = normalizeEmails(payload.cc);
+    const payload = (await req.json()) as SendEmailPayload & {
+      trainingName?: string;
+      siteName?: string;
+    };
+
+    toList = normalizeEmails(payload.to);
+    ccList = normalizeEmails(payload.cc);
     const bccList = normalizeEmails(payload.bcc);
+    subjectStr = payload.subject?.trim() || '';
+    htmlForPreview = payload.htmlContent || payload.emailHtmlBody || '';
+    trainingName = payload.trainingName?.trim() || null;
+    siteName = payload.siteName?.trim() || null;
 
     if (!toList) {
       return NextResponse.json({ error: 'Alamat email tujuan (To) wajib diisi.' }, { status: 400 });
     }
-    if (!payload.subject?.trim()) {
+    if (!subjectStr) {
       return NextResponse.json({ error: 'Subjek email wajib diisi.' }, { status: 400 });
     }
 
@@ -60,11 +79,13 @@ export async function POST(req: NextRequest) {
     }
 
     if (payload.attachHtml && payload.htmlContent) {
+      const htmlName = payload.htmlFileName || 'Laporan_Training.html';
       attachments.push({
-        filename: payload.htmlFileName || 'Laporan_Training.html',
+        filename: htmlName,
         content: payload.htmlContent,
         contentType: 'text/html',
       });
+      attachmentNames.push(htmlName);
     }
 
     if (Array.isArray(payload.extraAttachments)) {
@@ -75,19 +96,21 @@ export async function POST(req: NextRequest) {
             content: Buffer.from(item.base64, 'base64'),
             contentType: item.mimeType || 'application/octet-stream',
           });
+          attachmentNames.push(item.name);
         }
       });
     }
 
-    const senderName = payload.senderName?.trim() || session.user.name || 'PT Shelter Indonesia Gemilang';
+    const senderName =
+      payload.senderName?.trim() || session.user.name || 'PT Shelter Indonesia Gemilang';
 
     const mail = new MailComposer({
-      from: `"${senderName}" <${session.user.email}>`,
+      from: `"${senderName}" <${senderEmail}>`,
       to: toList,
       cc: ccList || undefined,
       bcc: bccList || undefined,
       replyTo: payload.replyTo?.trim() || undefined,
-      subject: payload.subject.trim(),
+      subject: subjectStr,
       text: payload.body || 'Laporan Giat Training terlampir.',
       html: payload.emailHtmlBody || undefined,
       attachments,
@@ -117,18 +140,69 @@ export async function POST(req: NextRequest) {
 
     if (!gmailRes.ok) {
       const errText = await gmailRes.text();
-      return NextResponse.json(
-        { error: `Gmail API Error (${gmailRes.status}): ${errText}` },
-        { status: gmailRes.status }
-      );
+      const errMsg = `Gmail API Error (${gmailRes.status}): ${errText}`;
+
+      await prisma.emailHistory
+        .create({
+          data: {
+            senderEmail,
+            toRecipients: toList,
+            ccRecipients: ccList || null,
+            subject: subjectStr,
+            trainingName,
+            siteName,
+            htmlBody: htmlForPreview,
+            attachments: JSON.stringify(attachmentNames),
+            status: 'GAGAL',
+            errorMessage: errMsg,
+          },
+        })
+        .catch((dbErr) => console.error('Gagal simpan log error ke DB:', dbErr));
+
+      return NextResponse.json({ error: errMsg }, { status: gmailRes.status });
     }
+
+    const savedHistory = await prisma.emailHistory.create({
+      data: {
+        senderEmail,
+        toRecipients: toList,
+        ccRecipients: ccList || null,
+        subject: subjectStr,
+        trainingName,
+        siteName,
+        htmlBody: htmlForPreview,
+        attachments: JSON.stringify(attachmentNames),
+        status: 'BERHASIL',
+      },
+    });
 
     return NextResponse.json({
       success: true,
-      message: `Email berhasil dikirim dari ${session.user.email} ke ${toList}.`,
+      historyId: savedHistory.id,
+      message: `Email berhasil dikirim dari ${senderEmail} ke ${toList}.`,
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Gagal mengirim email.';
+
+    if (senderEmail && toList) {
+      await prisma.emailHistory
+        .create({
+          data: {
+            senderEmail,
+            toRecipients: toList,
+            ccRecipients: ccList || null,
+            subject: subjectStr || '(Tanpa Subjek)',
+            trainingName,
+            siteName,
+            htmlBody: htmlForPreview,
+            attachments: JSON.stringify(attachmentNames),
+            status: 'GAGAL',
+            errorMessage: message,
+          },
+        })
+        .catch((dbErr) => console.error('Gagal simpan log error ke DB:', dbErr));
+    }
+
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

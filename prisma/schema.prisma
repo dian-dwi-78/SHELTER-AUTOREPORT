@@ -1,0 +1,27 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model EmailHistory {
+  id           Int      @id @default(autoincrement())
+  sentAt       DateTime @default(now())
+  senderEmail  String
+  toRecipients String
+  ccRecipients String?
+  subject      String
+  trainingName String?
+  siteName     String?
+  htmlBody     String
+  attachments  String?  // Disimpan sebagai JSON string, misal: '["absensi.xlsx"]'
+  status       String   // "BERHASIL" atau "GAGAL"
+  errorMessage String?
+
+  @@index([sentAt])
+  @@index([senderEmail])
+  @@index([status])
+}

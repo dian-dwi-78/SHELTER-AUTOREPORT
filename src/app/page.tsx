@@ -4,6 +4,8 @@ import React, { useMemo, useRef, useState } from 'react';
 import * as XLSX from 'xlsx';
 import JSZip from 'jszip';
 import { signIn, signOut, useSession } from 'next-auth/react';
+import UploadModal from '@/components/UploadModal';
+import HistoryModal from '@/components/HistoryModal';
 import type {
   AiNarrativeResponse,
   PhotoItem,
@@ -30,7 +32,8 @@ import {
 type ExcelRow = Record<string, unknown>;
 
 export default function TrainingReportPage() {
-  const { data: session } = useSession();
+  const { data: session, status: sessionStatus } = useSession();
+  const isLoggedIn = Boolean(session?.user?.email);
   const reportRef = useRef<HTMLDivElement>(null);
 
   const [meta, setMeta] = useState<ReportMeta>({
@@ -53,18 +56,24 @@ export default function TrainingReportPage() {
   const [rawPptFile, setRawPptFile] = useState<RawFileAttachment | null>(null);
   const [aiData, setAiData] = useState<AiNarrativeResponse | null>(null);
 
+  // Process & Status indicators
   const [status, setStatus] = useState<{ msg: string; type: '' | 'ok' | 'err' }>({
-    msg: 'Siap. Silakan unggah file Absen/Test, Materi PPT, dan Foto.',
+    msg: 'Siap. Klik "Upload File" untuk mulai menyusun laporan.',
     type: '',
   });
+  const [isReadingFile, setIsReadingFile] = useState(false);
   const [isAiLoading, setIsAiLoading] = useState(false);
+  const [isSendingEmail, setIsSendingEmail] = useState(false);
 
-  // Modal states
+  // Modal & Dropdown states
+  const [uploadModalOpen, setUploadModalOpen] = useState(false);
+  const [uploadModalError, setUploadModalError] = useState<string | null>(null);
+  const [historyModalOpen, setHistoryModalOpen] = useState(false);
+  const [downloadMenuOpen, setDownloadMenuOpen] = useState(false);
   const [metaModalOpen, setMetaModalOpen] = useState(false);
   const [draftMeta, setDraftMeta] = useState<ReportMeta>(meta);
 
   const [emailModalOpen, setEmailModalOpen] = useState(false);
-  const [isSendingEmail, setIsSendingEmail] = useState(false);
   const [emailForm, setEmailForm] = useState({
     to: '',
     cc: '',
@@ -84,6 +93,8 @@ export default function TrainingReportPage() {
   async function handleExcelUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
+    setIsReadingFile(true);
+    setUploadModalError(null);
     setStatus({ msg: `Membaca ${files.length} file Excel...`, type: '' });
 
     try {
@@ -120,14 +131,20 @@ export default function TrainingReportPage() {
       setRawExcelFiles((prev) => [...prev, ...newRaw]);
       setStatus({ msg: `Berhasil memuat ${files.length} file Excel.`, type: 'ok' });
     } catch (err: unknown) {
-      setStatus({ msg: `Gagal membaca Excel: ${err instanceof Error ? err.message : err}`, type: 'err' });
+      const msg = `Gagal membaca Excel: ${err instanceof Error ? err.message : err}`;
+      setStatus({ msg, type: 'err' });
+      setUploadModalError(msg);
+    } finally {
+      setIsReadingFile(false);
+      e.target.value = '';
     }
-    e.target.value = '';
   }
 
   async function handlePptUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
+    setIsReadingFile(true);
+    setUploadModalError(null);
     setStatus({ msg: `Mengekstrak materi dari ${file.name}...`, type: '' });
 
     try {
@@ -179,19 +196,25 @@ export default function TrainingReportPage() {
       });
 
       setStatus({
-        msg: `Materi PPT berhasil diekstrak (${slides.length} slide). Klik 'Rapikan dengan AI' untuk hasil optimal.`,
+        msg: `Materi PPT berhasil diekstrak (${slides.length} slide). Klik "Simpan" untuk merapikan dengan AI.`,
         type: 'ok',
       });
     } catch (err: unknown) {
-      setStatus({ msg: `Gagal membaca PPTX: ${err instanceof Error ? err.message : err}`, type: 'err' });
+      const msg = `Gagal membaca PPTX: ${err instanceof Error ? err.message : err}`;
+      setStatus({ msg, type: 'err' });
+      setUploadModalError(msg);
+    } finally {
+      setIsReadingFile(false);
+      e.target.value = '';
     }
-    e.target.value = '';
   }
 
   async function handlePhotoUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
-    setStatus({ msg: `Mengompresi ${files.length} foto...`, type: '' });
+    setIsReadingFile(true);
+    setUploadModalError(null);
+    setStatus({ msg: `Mengompresi ${files.length} foto dokumentasi...`, type: '' });
 
     try {
       const added: PhotoItem[] = [];
@@ -202,9 +225,13 @@ export default function TrainingReportPage() {
       setPhotos((prev) => [...prev, ...added]);
       setStatus({ msg: `Berhasil menambahkan ${files.length} foto (terkompresi).`, type: 'ok' });
     } catch (err: unknown) {
-      setStatus({ msg: `Gagal memproses foto: ${err instanceof Error ? err.message : err}`, type: 'err' });
+      const msg = `Gagal memproses foto: ${err instanceof Error ? err.message : err}`;
+      setStatus({ msg, type: 'err' });
+      setUploadModalError(msg);
+    } finally {
+      setIsReadingFile(false);
+      e.target.value = '';
     }
-    e.target.value = '';
   }
 
   // ============================================================================
@@ -350,16 +377,24 @@ export default function TrainingReportPage() {
   }, [meta, absensiRows, testRows, pptSlides]);
 
   // ============================================================================
-  // 3. CALL API GEMINI & EMAIL
+  // 3. CALL API GEMINI (DIPICU TOMBOL SIMPAN DI MODAL UPLOAD) & EMAIL
   // ============================================================================
-  async function handleAiRefine() {
+  async function handleSaveUploadAndRefine() {
+    setUploadModalError(null);
+
+    // Jika user hanya mengunggah foto tanpa Excel/PPT, langsung tutup modal
     if (!pptSlides.length && !absensiRows.length && !testRows.length) {
-      alert('Unggah minimal satu file (Excel atau PPT) sebelum menjalankan AI.');
+      if (photos.length > 0) {
+        setUploadModalOpen(false);
+        setStatus({ msg: `${photos.length} foto dokumentasi tersimpan ke laporan.`, type: 'ok' });
+        return;
+      }
+      setUploadModalError('Unggah minimal satu file sebelum menekan Simpan.');
       return;
     }
 
     setIsAiLoading(true);
-    setStatus({ msg: 'Menghubungi Gemini API untuk merapikan materi & analisis...', type: '' });
+    setStatus({ msg: 'Menghubungi Gemini AI untuk merapikan materi & analisis...', type: '' });
 
     try {
       const res = await fetch('/api/ai-refine', {
@@ -400,10 +435,11 @@ export default function TrainingReportPage() {
       }));
 
       setStatus({ msg: 'Laporan berhasil dirapikan dengan Gemini AI.', type: 'ok' });
+      setUploadModalOpen(false);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Error tidak diketahui';
       setStatus({ msg: `Gagal memproses AI: ${message}`, type: 'err' });
-      alert(`Gagal memproses AI: ${message}`);
+      setUploadModalError(`Gagal memproses AI: ${message}`);
     } finally {
       setIsAiLoading(false);
     }
@@ -419,6 +455,8 @@ export default function TrainingReportPage() {
     a.download = `Laporan_Training_${nama}.html`;
     a.click();
     URL.revokeObjectURL(a.href);
+    setDownloadMenuOpen(false);
+    setStatus({ msg: `File Laporan_Training_${nama}.html berhasil diunduh.`, type: 'ok' });
   }
 
   function openEmailDialog() {
@@ -443,13 +481,17 @@ export default function TrainingReportPage() {
     if (!reportRef.current) return;
 
     setIsSendingEmail(true);
+    setStatus({ msg: `Mengirim email laporan ke ${emailForm.to}...`, type: '' });
+
     try {
       const extraAttachments: RawFileAttachment[] = [];
       if (emailForm.attachExcel) extraAttachments.push(...rawExcelFiles);
       if (emailForm.attachPpt && rawPptFile) extraAttachments.push(rawPptFile);
 
       const cleanNama = (computed.judul || 'Training').replace(/[^a-zA-Z0-9]+/g, '_');
-      const payload: SendEmailPayload = {
+      const fullCleanHtml = buildCleanReportHtml(reportRef.current, computed.judul);
+
+      const payload: SendEmailPayload & { trainingName: string; siteName: string } = {
         to: emailForm.to,
         cc: emailForm.cc,
         bcc: emailForm.bcc,
@@ -464,8 +506,10 @@ export default function TrainingReportPage() {
         })),
         attachHtml: emailForm.attachHtml,
         htmlFileName: `Laporan_Training_${cleanNama}.html`,
-        htmlContent: emailForm.attachHtml ? buildCleanReportHtml(reportRef.current, computed.judul) : '',
+        htmlContent: fullCleanHtml, // selalu dikirim untuk preview riwayat DB (hanya dilampirkan jika attachHtml=true)
         extraAttachments,
+        trainingName: computed.judul,
+        siteName: computed.site,
       };
 
       const res = await fetch('/api/send-email', {
@@ -481,104 +525,180 @@ export default function TrainingReportPage() {
       setStatus({ msg: data.message, type: 'ok' });
       alert(data.message);
     } catch (err: unknown) {
-      alert(`Gagal mengirim email: ${err instanceof Error ? err.message : err}`);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      setStatus({ msg: `Gagal mengirim email: ${errMsg}`, type: 'err' });
+      alert(`Gagal mengirim email: ${errMsg}`);
     } finally {
       setIsSendingEmail(false);
     }
   }
+
+  const isAnyProcessRunning = isReadingFile || isAiLoading || isSendingEmail;
 
   // ============================================================================
   // 4. RENDER UI
   // ============================================================================
   return (
     <div className="min-h-screen bg-slate-100 text-slate-800">
-      {/* TOOLBAR (TIDAK IKUT TERCETAK) */}
-      <header className="sticky top-0 z-30 bg-slate-900 text-white shadow-md print:hidden">
-        <div className="mx-auto max-w-5xl px-4 py-3">
-          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-            <span className="text-sm font-bold tracking-wide">Training Report Generator</span>
-            <span
-              className={`text-xs font-medium ${
-                status.type === 'ok' ? 'text-emerald-400' : status.type === 'err' ? 'text-rose-400' : 'text-slate-300'
-              }`}
-            >
-              {status.msg}
+      {/* HEADER & TOOLBAR (TIDAK IKUT TERCETAK) */}
+      <header className="sticky top-0 z-30 bg-[#001247] text-white shadow-md print:hidden">
+        <div className="mx-auto max-w-5xl px-4 py-3.5">
+          {/* Baris Atas: Judul + Akun / Login */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span className="text-base font-extrabold tracking-wide text-white">
+              GIAT TRAINING REPORT GENERATOR
             </span>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <label className="cursor-pointer rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold hover:bg-slate-700">
-              Upload Absen / Test (.xlsx)
-              <input type="file" accept=".xlsx,.xls" multiple onChange={handleExcelUpload} className="hidden" />
-            </label>
-            <label className="cursor-pointer rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold hover:bg-slate-700">
-              Upload Materi (.pptx)
-              <input type="file" accept=".pptx" onChange={handlePptUpload} className="hidden" />
-            </label>
-            <label className="cursor-pointer rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold hover:bg-slate-700">
-              Upload Foto (Multi)
-              <input type="file" accept="image/*" multiple onChange={handlePhotoUpload} className="hidden" />
-            </label>
-            <button
-              type="button"
-              disabled={isAiLoading}
-              onClick={handleAiRefine}
-              className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold hover:bg-blue-500 disabled:opacity-50"
-            >
-              {isAiLoading ? 'Memproses AI...' : 'Rapikan dengan AI'}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setDraftMeta({
-                  ...meta,
-                  site: computed.site === '-' ? '' : computed.site,
-                  namaTraining: computed.judul === '-' ? '' : computed.judul,
-                });
-                setMetaModalOpen(true);
-              }}
-              className="rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold hover:bg-slate-700"
-            >
-              Edit Info
-            </button>
-            <button
-              type="button"
-              onClick={handleDownloadHtml}
-              className="rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold hover:bg-slate-700"
-            >
-              Unduh HTML
-            </button>
-            <button
-              type="button"
-              onClick={() => window.print()}
-              className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-semibold hover:bg-sky-500"
-            >
-              Cetak / PDF
-            </button>
-            <button
-              type="button"
-              onClick={openEmailDialog}
-              className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold hover:bg-emerald-500"
-            >
-              Kirim Email
-            </button>
 
-            {session?.user ? (
-              <button
-                type="button"
-                onClick={() => signOut()}
-                className="ml-auto rounded-md bg-slate-700 px-3 py-1.5 text-xs font-semibold text-amber-300 hover:bg-slate-600"
-                title={`Login sebagai ${session.user.email}`}
-              >
-                Logout ({session.user.email})
-              </button>
+            {sessionStatus === 'loading' ? (
+              <span className="rounded-lg bg-white/15 px-4 py-1.5 text-xs font-semibold text-blue-100">
+                Memeriksa sesi...
+              </span>
+            ) : isLoggedIn ? (
+              <div className="flex items-center gap-2">
+                <span className="rounded-lg bg-white px-3.5 py-1.5 text-xs font-bold text-[#001247] shadow-sm">
+                  {session?.user?.email}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => signOut()}
+                  className="rounded-lg border border-white/25 bg-white/10 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-600 hover:border-rose-600 transition-colors"
+                  title="Keluar dari akun Google"
+                >
+                  Logout
+                </button>
+              </div>
             ) : (
               <button
                 type="button"
                 onClick={() => signIn('google')}
-                className="ml-auto rounded-md bg-white px-3 py-1.5 text-xs font-semibold text-slate-900 hover:bg-slate-100"
+                className="rounded-lg bg-white px-5 py-2 text-xs font-extrabold tracking-wide text-[#001247] shadow-sm hover:bg-blue-50 transition-colors"
               >
-                Login Google
+                LOGIN GOOGLE
               </button>
+            )}
+          </div>
+
+          {/* Baris Bawah: Tombol Aksi (HANYA TAMPIL SETELAH LOGIN) */}
+          {isLoggedIn && (
+            <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-white/10 pt-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setUploadModalError(null);
+                  setUploadModalOpen(true);
+                }}
+                className="rounded-lg bg-sky-600 px-3.5 py-1.5 text-xs font-bold text-white shadow-sm hover:bg-sky-500 transition-colors"
+              >
+                Upload File
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setDraftMeta({
+                    ...meta,
+                    site: computed.site === '-' ? '' : computed.site,
+                    namaTraining: computed.judul === '-' ? '' : computed.judul,
+                  });
+                  setMetaModalOpen(true);
+                }}
+                className="rounded-lg bg-sky-600 px-3.5 py-1.5 text-xs font-bold text-white shadow-sm hover:bg-sky-500 transition-colors"
+              >
+                Edit Informasi
+              </button>
+
+              {/* Dropdown Unduh PDF / HTML */}
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setDownloadMenuOpen((prev) => !prev)}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 px-3.5 py-1.5 text-xs font-bold text-white shadow-sm hover:bg-sky-500 transition-colors"
+                >
+                  Unduh PDF/HTML
+                  <span className="text-[10px]">▾</span>
+                </button>
+                {downloadMenuOpen && (
+                  <>
+                    <div
+                      className="fixed inset-0 z-10"
+                      onClick={() => setDownloadMenuOpen(false)}
+                    />
+                    <div className="absolute left-0 z-20 mt-1.5 w-44 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 text-xs text-slate-700 shadow-lg">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDownloadMenuOpen(false);
+                          window.print();
+                        }}
+                        className="block w-full px-3.5 py-2 text-left font-semibold hover:bg-slate-100"
+                      >
+                        Cetak / Simpan PDF
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleDownloadHtml}
+                        className="block w-full px-3.5 py-2 text-left font-semibold hover:bg-slate-100"
+                      >
+                        Unduh File HTML (.html)
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <button
+                type="button"
+                onClick={openEmailDialog}
+                className="rounded-lg bg-emerald-600 px-3.5 py-1.5 text-xs font-bold text-white shadow-sm hover:bg-emerald-500 transition-colors"
+              >
+                Kirim Email
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setHistoryModalOpen(true)}
+                className="ml-auto rounded-lg bg-sky-600 px-4 py-1.5 text-xs font-bold text-white shadow-sm hover:bg-sky-500 transition-colors"
+              >
+                Riwayat
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* STATUS BAR DETAIL PROSES */}
+        <div className="border-t border-white/10 bg-[#000b2b] px-4 py-1.5">
+          <div className="mx-auto flex max-w-5xl items-center gap-2 text-[11px] font-medium">
+            {!isLoggedIn ? (
+              <span className="text-amber-300">
+                ● Silakan klik LOGIN GOOGLE di kanan atas untuk mulai menggunakan aplikasi.
+              </span>
+            ) : (
+              <>
+                {isAnyProcessRunning ? (
+                  <span className="inline-block h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-sky-400 border-t-transparent" />
+                ) : (
+                  <span
+                    className={`inline-block h-2 w-2 shrink-0 rounded-full ${
+                      status.type === 'ok'
+                        ? 'bg-emerald-400'
+                        : status.type === 'err'
+                        ? 'bg-rose-400'
+                        : 'bg-sky-400'
+                    }`}
+                  />
+                )}
+                <span
+                  className={
+                    status.type === 'ok'
+                      ? 'text-emerald-300'
+                      : status.type === 'err'
+                      ? 'text-rose-300'
+                      : 'text-slate-200'
+                  }
+                >
+                  {status.msg}
+                </span>
+              </>
             )}
           </div>
         </div>
@@ -676,7 +796,7 @@ export default function TrainingReportPage() {
                 ? stripEmoji(meta.tujuan)
                 : computed.judul !== '-'
                 ? `Program berfokus pada materi ${computed.judul} dalam pekerjaan operasional beserta penguatan standar kerja personel.`
-                : 'Belum ada ringkasan materi. Unggah file PPT materi atau isi melalui tombol Edit Info.'}
+                : 'Belum ada ringkasan materi. Unggah file PPT materi melalui tombol Upload File atau isi melalui Edit Informasi.'}
             </div>
 
             {aiData?.tujuan?.length ? (
@@ -868,24 +988,26 @@ export default function TrainingReportPage() {
                   <div key={idx} className="rounded-lg border border-slate-200 bg-white p-2">
                     <img src={photo.src} alt={photo.caption} className="mb-2 h-48 w-full rounded object-cover" />
                     <div className="text-xs font-bold text-slate-800">{photo.caption}</div>
-                    <div className="no-export mt-2 flex gap-1.5 print:hidden">
-                      <input
-                        type="text"
-                        value={photo.caption}
-                        onChange={(e) =>
-                          setPhotos((prev) => prev.map((p, i) => (i === idx ? { ...p, caption: e.target.value } : p)))
-                        }
-                        className="flex-1 rounded border border-slate-300 px-2 py-1 text-xs"
-                        placeholder="Edit caption..."
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setPhotos((prev) => prev.filter((_, i) => i !== idx))}
-                        className="rounded bg-rose-100 px-2 py-1 text-xs font-semibold text-rose-700 hover:bg-rose-200"
-                      >
-                        Hapus
-                      </button>
-                    </div>
+                    {isLoggedIn && (
+                      <div className="no-export mt-2 flex gap-1.5 print:hidden">
+                        <input
+                          type="text"
+                          value={photo.caption}
+                          onChange={(e) =>
+                            setPhotos((prev) => prev.map((p, i) => (i === idx ? { ...p, caption: e.target.value } : p)))
+                          }
+                          className="flex-1 rounded border border-slate-300 px-2 py-1 text-xs"
+                          placeholder="Edit caption..."
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setPhotos((prev) => prev.filter((_, i) => i !== idx))}
+                          className="rounded bg-rose-100 px-2 py-1 text-xs font-semibold text-rose-700 hover:bg-rose-200"
+                        >
+                          Hapus
+                        </button>
+                      </div>
+                    )}
                   </div>
                 ))
               )}
@@ -896,7 +1018,7 @@ export default function TrainingReportPage() {
               6. Daftar Hadir Training
             </h2>
             {computed.sesiKeys.length === 0 ? (
-              <div className="text-xs text-slate-500">Belum ada data daftar hadir. Unggah file Excel absensi di atas.</div>
+              <div className="text-xs text-slate-500">Belum ada data daftar hadir. Unggah file Excel absensi melalui tombol Upload File.</div>
             ) : (
               computed.sesiKeys.map((dk, idx) => {
                 const list = computed.sesiMap[dk];
@@ -968,6 +1090,45 @@ export default function TrainingReportPage() {
           </div>
         </main>
       </div>
+
+      {/* MODAL UPLOAD 3-IN-1 */}
+      <UploadModal
+        open={uploadModalOpen}
+        onClose={() => setUploadModalOpen(false)}
+        onExcelUpload={handleExcelUpload}
+        onPptUpload={handlePptUpload}
+        onPhotoUpload={handlePhotoUpload}
+        onClearExcel={() => {
+          setAbsensiRows([]);
+          setTestRows([]);
+          setRawExcelFiles([]);
+          setStatus({ msg: 'Data Excel direset.', type: '' });
+        }}
+        onClearPpt={() => {
+          setPptSlides([]);
+          setRawPptFile(null);
+          setAiData(null);
+          setStatus({ msg: 'Data Materi PPT direset.', type: '' });
+        }}
+        onClearPhotos={() => {
+          setPhotos([]);
+          setStatus({ msg: 'Foto dokumentasi direset.', type: '' });
+        }}
+        rawExcelFiles={rawExcelFiles}
+        absensiCount={absensiRows.length}
+        testCount={testRows.length}
+        rawPptFile={rawPptFile}
+        pptSlideCount={pptSlides.length}
+        photosCount={photos.length}
+        isReadingFile={isReadingFile}
+        isAiLoading={isAiLoading}
+        status={status}
+        modalError={uploadModalError}
+        onSaveAndRefine={handleSaveUploadAndRefine}
+      />
+
+      {/* MODAL RIWAYAT */}
+      <HistoryModal open={historyModalOpen} onClose={() => setHistoryModalOpen(false)} />
 
       {/* MODAL EDIT INFO */}
       {metaModalOpen && (
@@ -1048,24 +1209,7 @@ export default function TrainingReportPage() {
             </div>
 
             <div className="mb-3 rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-700">
-              {session?.user?.email ? (
-                <>
-                  Pengirim aktif: <b>{session.user.email}</b>
-                </>
-              ) : (
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-semibold text-rose-600">
-                    Anda belum login. Login Google dulu agar email terkirim dari akun Anda.
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => signIn('google')}
-                    className="shrink-0 rounded bg-blue-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-blue-500"
-                  >
-                    Login Google
-                  </button>
-                </div>
-              )}
+              Pengirim aktif: <b>{session?.user?.email}</b>
             </div>
 
             <div className="space-y-3 text-xs">
